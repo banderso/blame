@@ -1,0 +1,112 @@
+(ns blame.core
+  (:use [blame.stty :only [stty]])
+  (:require [clojure.string :as string]
+            [noise.core :as noise])
+  (:import [java.io IOException])
+  (:gen-class))
+
+(def ^:private ttyconfig (atom nil))
+(defonce ESC (char 0x1B))
+(defonce key-map {ESC :esc
+                  0x61 \a})
+
+(defn set-terminal-to-cbreak! []
+  (do (reset! ttyconfig (stty "-g"))
+      (stty "raw")
+      (stty "-echo")))
+
+(defn to-byte [c] (byte (int c)))
+
+(defn write-to-term [& cmd]
+  (.write System/out (into-array Byte/TYPE cmd)))
+
+(defn move-to [x y]
+  (apply write-to-term (map to-byte (cons 0x1b (str \[ (inc x) \; (inc y) \H)))))
+
+(defn clear-screen []
+  (apply write-to-term (map to-byte (cons 0x1b "[2J")))
+  (move-to 0 0))
+
+(defn decode-input [inp]
+  (reduce str (map #(condp = %
+                      0x1B "^["
+                      (char %)) inp)))
+(defn parse-control-input [inp]
+  (if (= ESC (first inp))
+    ))
+
+(defn parse-input [inp]
+  (if (= 1 (count inp))
+    (let [c (first inp)]
+      (if (or (<= 0x00 c 0x1F)
+              (= c 0x7F)
+              (<= 0x80 c 0x9F))
+        (parse-control-input c)
+        (char c)))
+    (loop)))
+
+(defn log-input [cnt inp]
+  (printf "%d [" cnt)
+  (loop [ic inp]
+    (if (first ic)
+      (do (printf "0x%x" (first ic))
+          (when (first (rest ic))
+            (printf " "))
+          (recur (rest ic)))
+      (printf "]\r\n")))
+  (flush))
+
+(defn prompt []
+  (print (str (char 0x276F) " "))
+  (flush))
+
+(def client (atom nil))
+
+(defn connect-to-server! [host port]
+  (reset! client (noise/client :port port :bind host)))
+
+(def byte-mask 0x7F)
+(def neg-byte-mask -128)
+(defn <byte [ibyte]
+  (if (>= ibyte 128)
+    (byte (bit-or neg-byte-mask (bit-and byte-mask ibyte)))
+    (byte (bit-and byte-mask ibyte))))
+
+(defn read-full-input []
+  (let [c (transient [])]
+    (loop []
+      (do (conj! c (<byte (.read System/in)))
+          (if (zero? (.available System/in))
+            (persistent! c)
+            (recur))))))
+
+(defn read-input! []
+  (try (do (set-terminal-to-cbreak!)
+           (clear-screen)
+           ;(println (stty "-a"))
+           (prompt)
+           (loop [i 0]
+             (let [inp (read-full-input)]
+               (do (log-input i inp)
+                   (if (= (nth inp 0) 0x1B)
+                     nil
+                     (do (prompt)
+                         (recur (inc i))))))))
+       (catch IOException e (binding [*out* *err*]
+                              (println "IOException")
+                              (.printStackTrace e)))
+       (catch InterruptedException e (binding [*out* *err*]
+                                       (println "InterruptedException")))
+       (finally (when @ttyconfig 
+                  (try (stty (string/trim @ttyconfig))
+                       (catch Exception e (binding [*out* *err*]
+                                            (println "Exception restorying tty config"))))))))
+
+(defn print-usage []
+  (println "blame host port"))
+
+(defn -main [& args]
+  (if (< (count args) 2)
+    (print-usage)
+    (do (comment (connect-to-server! (first args) (Long/parseLong (first (rest args)))))
+        (read-input!))))
